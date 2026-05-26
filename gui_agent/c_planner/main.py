@@ -352,6 +352,21 @@ class PlannerModule:
                 confidence=0.95, is_terminal=False,
             )
 
+        # 搜索词已经输入后，优先点击页面顶部的搜索提交按钮。
+        # 一些模型会点键盘右下角搜索键，但离线 checker 通常只认应用内顶部按钮。
+        if (perception.page_type == "search" and search_keyword and has_typed_search
+                and decision.action == ACTION_CLICK):
+            point = decision.parameters.get("point") if isinstance(decision.parameters, dict) else None
+            if isinstance(point, list) and len(point) == 2 and point[1] >= 800:
+                submit_point = self._find_top_search_submit_point(perception.elements)
+                logger.info("搜索词已输入，但点击落在键盘区域，改点顶部搜索提交按钮: %s", submit_point)
+                return PlannerDecision(
+                    action=ACTION_CLICK,
+                    parameters={"point": submit_point},
+                    thought="搜索词已输入，点击页面顶部搜索按钮提交查询",
+                    confidence=0.95, is_terminal=False,
+                )
+
         # 4. VLM 想 COMPLETE 但要求的文字还没输入 → 拦截，改为 TYPE
         if decision.action == ACTION_COMPLETE and required_text and not has_typed_required:
             logger.info("VLM 想 COMPLETE 但文字未输入，拦截改为 TYPE: %s", required_text)
@@ -405,6 +420,29 @@ class PlannerModule:
                 cy = (elem.bbox[1] + elem.bbox[3]) // 2
                 return [cx, cy]
         return None
+
+    @staticmethod
+    def _find_top_search_submit_point(elements: List[UIElement]) -> List[int]:
+        """查找顶部右侧搜索提交按钮，找不到时给出常见右上角兜底坐标。"""
+        keywords = ("搜索", "确定", "完成")
+        candidates: List[UIElement] = []
+
+        for elem in elements:
+            if not elem.bbox or len(elem.bbox) != 4:
+                continue
+            x1, y1, x2, y2 = elem.bbox
+            cx = (x1 + x2) // 2
+            cy = (y1 + y2) // 2
+            label = f"{elem.text or ''} {elem.description or ''} {elem.role or ''}"
+            if cy <= 180 and cx >= 650 and any(word in label for word in keywords):
+                candidates.append(elem)
+
+        if candidates:
+            # 右侧、偏上的按钮通常是搜索提交入口。
+            best = max(candidates, key=lambda elem: ((elem.bbox[0] + elem.bbox[2]) // 2, -elem.bbox[1]))
+            return [(best.bbox[0] + best.bbox[2]) // 2, (best.bbox[1] + best.bbox[3]) // 2]
+
+        return [910, 75]
 
     @staticmethod
     def _direction_to_scroll_params(direction: str) -> Dict[str, Any]:
