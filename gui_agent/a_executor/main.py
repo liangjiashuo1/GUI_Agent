@@ -1,8 +1,7 @@
 """
 A: Executor module entry.
 
-This version intentionally removes all OPEN-based adb launch logic.
-Only CLICK / SCROLL / TYPE / COMPLETE are supported.
+Supports CLICK / SCROLL / TYPE / OPEN / COMPLETE.
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Tuple
 if TYPE_CHECKING:
     from PIL import Image
 
-from agent_base import ACTION_CLICK, ACTION_COMPLETE, ACTION_SCROLL, ACTION_TYPE, AgentOutput
+from agent_base import ACTION_CLICK, ACTION_COMPLETE, ACTION_OPEN, ACTION_SCROLL, ACTION_TYPE, AgentOutput
 from gui_agent.shared.schemas import PlannerDecision, clamp_point
 
 logger = logging.getLogger(__name__)
@@ -27,6 +26,15 @@ class ExecutorModule:
     DEFAULT_SCREEN_SIZE = (1080, 2340)
     DEFAULT_MUMU_DEVICE = "127.0.0.1:16384"
     DEFAULT_ADB_PATH = r"D:\Tools\platform-tools\adb.exe"
+    DEFAULT_LAUNCH_COMPONENTS = {
+        "微信": "com.tencent.mm/.ui.LauncherUI",
+        "QQ": "com.tencent.mobileqq/.activity.SplashActivity",
+        "哔哩哔哩": "tv.danmaku.bili/.ui.splash.SplashActivity",
+        "B站": "tv.danmaku.bili/.ui.splash.SplashActivity",
+        "抖音": "com.ss.android.ugc.aweme/.main.MainActivity",
+        "淘宝": "com.taobao.taobao/com.taobao.tao.welcome.Welcome",
+        "爱奇艺": "com.qiyi.video/.WelcomeActivity",
+    }
 
     def __init__(self, adb_path: str | None = None, device_serial: str | None = None) -> None:
         self._adb_path = self._resolve_adb_path(adb_path)
@@ -56,7 +64,7 @@ class ExecutorModule:
             return int(match.group(1)), int(match.group(2))
         except Exception as exc:
             logger.warning(
-                "获取屏幕分辨率失败，回退到默认值 %sx%s: %s",
+                "获取屏幕尺寸失败，回退到默认值 %sx%s: %s",
                 self.DEFAULT_SCREEN_SIZE[0],
                 self.DEFAULT_SCREEN_SIZE[1],
                 exc,
@@ -77,7 +85,7 @@ class ExecutorModule:
         command = device_command["command"]
 
         if not command:
-            logger.info("收到 COMPLETE 动作，不执行 adb 命令。")
+            logger.info("收到 COMPLETE 动作，无需执行 adb 命令。")
             return True
 
         try:
@@ -85,10 +93,10 @@ class ExecutorModule:
             return True
         except subprocess.CalledProcessError as exc:
             stderr = (exc.stderr or "").strip()
-            logger.error("执行 ADB 指令失败: %s | stderr=%s", exc, stderr)
+            logger.error("执行 ADB 命令失败: %s | stderr=%s", exc, stderr)
             return False
         except Exception as exc:
-            logger.error("执行 ADB 指令失败: %s", exc)
+            logger.error("执行 ADB 命令失败: %s", exc)
             return False
 
     def compile_decision(self, decision: PlannerDecision) -> AgentOutput:
@@ -110,10 +118,13 @@ class ExecutorModule:
             text = self._escape_adb_text(parameters["text"])
             return ["shell", "input", "text", text]
 
+        if action == ACTION_OPEN:
+            return self._build_open_command(parameters["app_name"])
+
         if action == ACTION_COMPLETE:
             return []
 
-        raise ValueError(f"不支持的动作类型: {action}")
+        raise ValueError(f"不支持的执行动作: {action}")
 
     def _sanitize_parameters(self, action: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
         if action == ACTION_CLICK:
@@ -138,10 +149,16 @@ class ExecutorModule:
                 raise ValueError("TYPE 参数必须是 {'text': '...'}")
             return {"text": text}
 
+        if action == ACTION_OPEN:
+            app_name = parameters.get("app_name")
+            if not isinstance(app_name, str) or not app_name.strip():
+                raise ValueError("OPEN 参数必须是 {'app_name': '...'}")
+            return {"app_name": app_name.strip()}
+
         if action == ACTION_COMPLETE:
             return {}
 
-        raise ValueError(f"不支持的动作类型: {action}")
+        raise ValueError(f"不支持的执行动作: {action}")
 
     @staticmethod
     def _is_point(value: Any) -> bool:
@@ -163,14 +180,14 @@ class ExecutorModule:
             self._last_visual_size = (image.width, image.height)
             return image
         except subprocess.TimeoutExpired:
-            logger.error("截图超时，ADB 命令在 10 秒内未返回结果。")
+            logger.error("ADB 截图超时（10 秒）。")
             return None
         except subprocess.CalledProcessError as exc:
             stderr = exc.stderr.decode("utf-8", errors="ignore") if exc.stderr else ""
-            logger.error("执行截图命令失败，返回码=%s stderr=%s", exc.returncode, stderr.strip())
+            logger.error("ADB 截图失败 returncode=%s stderr=%s", exc.returncode, stderr.strip())
             return None
         except Exception as exc:
-            logger.error("截图或图像处理失败: %s", exc)
+            logger.error("截图加载失败: %s", exc)
             return None
 
     def _normalized_to_absolute(self, point: List[int]) -> Tuple[int, int]:
@@ -178,6 +195,41 @@ class ExecutorModule:
         x = int(point[0] / 1000.0 * width)
         y = int(point[1] / 1000.0 * height)
         return x, y
+
+    def _build_open_command(self, app_name: str) -> List[str]:
+        launch_target = self._resolve_launch_target(app_name)
+        if "/" in launch_target:
+            return ["shell", "am", "start", "-n", launch_target]
+        return [
+            "shell",
+            "monkey",
+            "-p",
+            launch_target,
+            "-c",
+            "android.intent.category.LAUNCHER",
+            "1",
+        ]
+
+    def _resolve_launch_target(self, app_name: str) -> str:
+        app_name = app_name.strip()
+        if not app_name:
+            raise ValueError("OPEN 动作缺少 app_name")
+
+        if "/" in app_name:
+            return app_name
+
+        mapped = self.DEFAULT_LAUNCH_COMPONENTS.get(app_name)
+        if mapped:
+            return mapped
+
+        # If the planner already returns a package name, launch it with monkey.
+        if "." in app_name and " " not in app_name:
+            return app_name
+
+        raise ValueError(
+            f"未找到应用“{app_name}”的启动配置。"
+            "请传入完整组件名（package/.Activity）或在 DEFAULT_LAUNCH_COMPONENTS 中补充映射。"
+        )
 
     @staticmethod
     def _escape_adb_text(text: str) -> str:
@@ -228,7 +280,7 @@ class ExecutorModule:
                 check=True,
             )
         except Exception as exc:
-            logger.warning("列出 adb 设备失败: %s", exc)
+            logger.warning("列出 adb devices 失败: %s", exc)
             return []
 
         devices: List[str] = []
