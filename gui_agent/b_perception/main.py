@@ -81,16 +81,26 @@ _SYSTEM_PROMPT = """你是一个专业的手机GUI屏幕分析助手。你的任
 
 ## 常见 App 识别特征
 - 爱奇艺：绿色主题，视频播放，底部 首页/随刻/会员/我的
-- 抖音：黑色背景，短视频，底部 首页/朋友/消息/我
-- 快手：橙色主题，短视频，底部 首页/发现/消息/我
+- 哔哩哔哩(B站)：粉色/粉蓝色主题，底部 首页/热门/动态/我的，搜索页有"热搜"标签
+- 抖音：黑色背景，短视频，底部 首页/朋友/消息/我，顶部有"推荐/附近/关注"Tab
+- 快手：橙色/红色主题，短视频，底部 首页/发现/消息/我，顶部有"关注/发现/精选"Tab
+- 芒果TV：橙色主题，视频播放，底部 首页/会员/我的，搜索页橙色搜索框
+- 腾讯视频：蓝黑/深蓝色主题，视频播放，底部 首页/会员/我的，搜索框蓝底白字
 - 百度地图：地图界面，底部 首页/出行/周边/我的
 - 微信：绿色主题，聊天列表，底部 微信/通讯录/发现/我
 - QQ：浅蓝主题，聊天，底部 消息/联系人/动态
 - 美团：黄色主题，底部 首页/我的
 - 淘宝：橙色主题，商品列表，底部 首页/购物车/消息/我的
-- 腾讯视频：蓝黑主题，视频播放
 - 喜马拉雅：橙红主题，音频播放
-- 芒果TV：橙色主题，视频播放"""
+
+## element_id 选择规则
+- 每个 OCR 元素有唯一 element_id（如 ocr_0, ocr_1）
+- 你需要为 task 目标选择最相关的元素，返回它的 element_id
+- **关键**：仔细对比 OCR 列表中每个元素的文字内容和位置，确保 element_id 对应正确的元素
+- 底部Tab元素通常 y 坐标 > 900
+- 搜索框通常在 y 坐标 40-120 之间
+- 顶部导航Tab通常在 y 坐标 40-100 之间"""
+
 
 _USER_TEMPLATE = """## 任务目标
 {instruction}
@@ -116,6 +126,8 @@ class PerceptionModule:
         # OCR 缓存：同一张图只跑一次 OCR
         self._ocr_cache: Optional[List[Dict[str, Any]]] = None
         self._ocr_cache_image_id: Optional[int] = None
+        # 最低置信度阈值，低于此值的 OCR 结果将被丢弃
+        self._ocr_confidence_threshold: float = 0.2
 
     # ------------------------------------------------------------------
     # 公开接口（E 模块调用）
@@ -139,6 +151,17 @@ class PerceptionModule:
             ocr_count=ocr_count,
             ocr_list=ocr_list_str,
         )
+
+        # 注入目标应用名提示，帮助 VLM 正确识别 app_name
+        app_hint = self._guess_app_name(input_data.instruction)
+        if app_hint:
+            user_text += (
+                f'\n\n## 重要提示\n'
+                f'根据任务指令，目标应用是 **"{app_hint}"**，'
+                f'请在 app_name 字段中返回此名称。'
+                f'如果屏幕显示的应用图标或界面特征与该应用匹配，请确认为当前应用。'
+            )
+
         image_url = encode_image_to_base64(input_data.current_image)
 
         return [
@@ -189,11 +212,38 @@ class PerceptionModule:
         # ---- 核心：OCR + VLM 融合 ----
         result = self._merge_ocr_into_perception(result, ocr_elements)
 
+        # ---- OCR 后处理增强：键盘检测 + 页面类型纠错 ----
+        # C 模块的搜索/输入硬规则依赖这两个字段，因此不要完全相信 VLM。
+        if self._detect_keyboard_via_ocr(ocr_elements):
+            result.keyboard_visible = True
+
+        ocr_texts = [e["text"] for e in ocr_elements]
+        inferred_page = self._infer_page_type_from_ocr(ocr_texts, result.elements)
+        if inferred_page:
+            # popup/search/detail 这类状态对动作决策影响更大，优先采用 OCR 纠错结果。
+            if result.page_type in ("unknown", "home") or inferred_page in ("popup", "search", "detail", "settings"):
+                result.page_type = inferred_page
+            if result.screen_summary:
+                result.screen_summary = f"{result.screen_summary} | OCR推断页面类型: {inferred_page}"
+            else:
+                result.screen_summary = f"OCR推断页面类型: {inferred_page}"
+
         # 兜底：VLM 没给出 app_name 或给出了模糊/无关名称时用关键词猜测
         _vague_names = {"未知", "unknown", "Unknown", "无法判断", "不确定",
                         "系统应用", "桌面", "手机桌面", "主屏幕", "Home", "home",
-                        "安卓", "Android", "系统桌面", "Launcher"}
-        if (not result.app_name or result.app_name in _vague_names):
+                        "安卓", "Android", "系统桌面", "Launcher",
+                        "手机系统", "系统界面", "System UI", "桌面系统",
+                        "安卓桌面", "Android桌面", "启动器", "默认桌面", "系统启动器"}
+        # 短名称启发式：≤2字且不在已知app列表中，大概率是截断名称
+        _known_apps_set = {
+            "爱奇艺", "百度地图", "哔哩哔哩", "抖音", "快手", "芒果TV",
+            "美团", "腾讯视频", "喜马拉雅", "QQ", "淘宝", "微信",
+            "京东", "拼多多", "铁路12306", "大众点评", "B站",
+        }
+        app_name = result.app_name.strip() if result.app_name else ""
+        is_vague = (not app_name or app_name in _vague_names)
+        is_short = (len(app_name) <= 2 and app_name not in _known_apps_set)
+        if is_vague or is_short:
             guess = self._guess_app_name(input_data.instruction)
             if guess:
                 result.app_name = guess
@@ -303,6 +353,15 @@ class PerceptionModule:
             if not text:
                 continue  # 忽略空文本
 
+            # 置信度过滤：过低的结果多为噪声；但关键控件词即使低置信度也先保留。
+            important_keywords = [
+                "搜索", "搜", "评论", "发送", "发布", "我的", "首页", "跳过",
+                "关闭", "取消", "下载", "缓存", "离线", "播放", "确定", "确认",
+            ]
+            is_important = any(k in text for k in important_keywords)
+            if conf < self._ocr_confidence_threshold and not is_important:
+                continue
+
             # bbox 是四个角点 [(x1,y1), (x2,y2), (x3,y3), (x4,y4)]
             xs = [p[0] for p in bbox]
             ys = [p[1] for p in bbox]
@@ -330,13 +389,52 @@ class PerceptionModule:
                 "source": "ocr",
             })
 
-        logger.info("OCR 识别到 %d 个文字元素", len(elements))
+        logger.info("OCR 识别到 %d 个文字元素（去重前）", len(elements))
+
+        # IoU 去重：重叠度过高的元素保留置信度高者
+        elements = PerceptionModule._deduplicate_by_iou(elements)
+
+        # 按空间位置排序后重新分配 element_id（确保 ocr_0=最上方, ocr_N=最下方）
+        elements.sort(key=lambda e: (
+            (e["bbox"][1] + e["bbox"][3]) // 2 // 50,  # y 中心分组（每50px）
+            (e["bbox"][0] + e["bbox"][2]) // 2,         # 同组按 x 中心排序
+        ))
+        for new_i, elem in enumerate(elements):
+            elem["element_id"] = f"ocr_{new_i}"
 
         # 写入缓存
         self._ocr_cache = elements
         self._ocr_cache_image_id = img_id
 
         return elements
+
+    @staticmethod
+    def _deduplicate_by_iou(elements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """IoU 去重：两个元素 bbox 重叠度 > 0.7 时保留置信度更高者。"""
+        if len(elements) <= 1:
+            return elements
+
+        def _iou(a: List[int], b: List[int]) -> float:
+            x_overlap = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+            y_overlap = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+            inter = x_overlap * y_overlap
+            area_a = (a[2] - a[0]) * (a[3] - a[1])
+            area_b = (b[2] - b[0]) * (b[3] - b[1])
+            union = area_a + area_b - inter
+            return inter / union if union > 0 else 0.0
+
+        kept: List[Dict[str, Any]] = []
+        for elem in elements:
+            replaced = False
+            for i, existing in enumerate(kept):
+                if _iou(elem["bbox"], existing["bbox"]) > 0.7:
+                    if elem["confidence"] > existing["confidence"]:
+                        kept[i] = elem  # 替换为置信度更高的
+                    replaced = True
+                    break
+            if not replaced:
+                kept.append(elem)
+        return kept
 
     # ------------------------------------------------------------------
     # OCR + VLM 融合
@@ -371,7 +469,7 @@ class PerceptionModule:
             if not vlm_text:
                 continue
 
-            matched_ocr = self._match_ocr_text(vlm_text, ocr_elements)
+            matched_ocr = self._match_ocr_text(vlm_text, ocr_elements, elem.bbox)
             if matched_ocr:
                 elem.bbox = matched_ocr["bbox"]
                 elem.confidence = max(elem.confidence, matched_ocr["confidence"])
@@ -386,46 +484,362 @@ class PerceptionModule:
                 continue  # 文本已被 VLM 元素覆盖
             # 判断是否可能是有意义的交互元素
             if self._is_likely_interactive(ocr_elem):
+                hint = PerceptionModule._infer_ocr_role_hint(ocr_elem["text"], ocr_elem["bbox"])
+                role = "other"
+                desc = f"OCR: {ocr_elem['text']}"
+                if hint:
+                    desc += f"（{hint}）"
+                    # 根据角色提示推断 role
+                    if "按钮" in hint or "入口" in hint:
+                        role = "button"
+                    elif "输入框" in hint:
+                        role = "input"
+                    elif "Tab" in hint:
+                        role = "tab"
+                    elif "广告" in hint:
+                        role = "other"
+                        perception.warnings.append(f"检测到可能的广告: {ocr_elem['text']}")
                 perception.elements.append(UIElement(
                     element_id=ocr_elem["element_id"],
-                    role="other",
+                    role=role,
                     text=ocr_elem["text"],
-                    description=f"OCR识别: {ocr_elem['text']}",
+                    description=desc,
                     bbox=ocr_elem["bbox"],
                     clickable=True,
                     enabled=True,
                     confidence=ocr_elem["confidence"],
                 ))
 
+        # 第 3 步：为爱奇艺常见纯图标控件补充虚拟元素，弥补 OCR 只能识别文字的问题。
+        perception = self._add_iqiyi_virtual_elements(perception, ocr_elements)
+
+        # 第 4 步：为所有元素描述添加屏幕位置标注，帮助 C 模块 VLM 区分相似元素。
+        for elem in perception.elements:
+            pos = PerceptionModule._describe_screen_position(elem.bbox)
+            if pos and pos not in (elem.description or ""):
+                if elem.description:
+                    elem.description = f"{elem.description} | {pos}"
+                else:
+                    elem.description = pos
+
+        # 第 5 步：统一去重，避免同一文字/同一位置同时出现 OCR 和 VLM 元素。
+        perception.elements = PerceptionModule._deduplicate_ui_elements(perception.elements)
+
         return perception
+
+    @staticmethod
+    def _deduplicate_ui_elements(elements: List[UIElement]) -> List[UIElement]:
+        """去除 VLM 元素和 OCR 元素之间的重复框。
+
+        保留策略：
+        - 优先保留 clickable=True 的元素；
+        - 其次保留 bbox 完整、confidence 更高的元素；
+        - 文本完全相同或 bbox 高度重叠时视为重复。
+        """
+        if len(elements) <= 1:
+            return elements
+
+        def _iou(a: List[int], b: List[int]) -> float:
+            if not a or not b or len(a) != 4 or len(b) != 4:
+                return 0.0
+            x1 = max(a[0], b[0])
+            y1 = max(a[1], b[1])
+            x2 = min(a[2], b[2])
+            y2 = min(a[3], b[3])
+            inter = max(0, x2 - x1) * max(0, y2 - y1)
+            area_a = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
+            area_b = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+            union = area_a + area_b - inter
+            return inter / union if union > 0 else 0.0
+
+        def _score(elem: UIElement) -> float:
+            return (
+                int(elem.clickable) * 3
+                + int(bool(elem.bbox and len(elem.bbox) == 4)) * 2
+                + float(elem.confidence or 0.0)
+            )
+
+        kept: List[UIElement] = []
+        for elem in elements:
+            duplicate_idx: Optional[int] = None
+            for idx, old in enumerate(kept):
+                same_text = bool(elem.text and old.text and elem.text == old.text)
+                high_overlap = _iou(elem.bbox, old.bbox) > 0.65
+                if same_text or high_overlap:
+                    duplicate_idx = idx
+                    break
+
+            if duplicate_idx is None:
+                kept.append(elem)
+            else:
+                if _score(elem) > _score(kept[duplicate_idx]):
+                    kept[duplicate_idx] = elem
+
+        return kept
+
+    @staticmethod
+    def _add_iqiyi_virtual_elements(
+        perception: ScreenPerception,
+        ocr_elements: List[Dict[str, Any]],
+    ) -> ScreenPerception:
+        """为爱奇艺常见纯图标控件补充虚拟元素。
+
+        这些控件往往没有可 OCR 的文字，但在爱奇艺任务中经常被点击。
+        坐标使用 [0, 1000] 归一化坐标，作为保守兜底候选交给 C 模块选择。
+        """
+        app_name = perception.app_name or ""
+        all_text = " ".join(e.get("text", "") for e in ocr_elements)
+        if "爱奇艺" not in app_name and "爱奇艺" not in all_text:
+            return perception
+
+        existing_ids = {elem.element_id for elem in perception.elements}
+
+        def _add(
+            element_id: str,
+            role: str,
+            text: str,
+            description: str,
+            bbox: List[int],
+            confidence: float,
+        ) -> None:
+            if element_id in existing_ids:
+                return
+            perception.elements.append(UIElement(
+                element_id=element_id,
+                role=role,
+                text=text,
+                description=description,
+                bbox=bbox,
+                clickable=True,
+                enabled=True,
+                confidence=confidence,
+            ))
+            existing_ids.add(element_id)
+
+        # 首页/搜索页顶部搜索区域：有些界面只有放大镜图标或提示文字，OCR bbox 不一定覆盖整个输入框。
+        if perception.page_type in ("home", "search", "unknown") and any(k in all_text for k in ["搜索", "搜", "热搜"]):
+            _add(
+                "virtual_top_search_box",
+                "input",
+                "搜索框",
+                "爱奇艺顶部搜索输入框兜底区域",
+                [70, 45, 830, 120],
+                0.66,
+            )
+
+        # 弹窗/广告关闭区域：避免 C 模块误点开通会员、广告位。
+        if perception.page_type == "popup" or any(k in all_text for k in ["广告", "跳过", "开通会员", "立即开通"]):
+            _add(
+                "virtual_popup_close",
+                "button",
+                "关闭",
+                "弹窗/广告右上角关闭或跳过按钮兜底区域",
+                [875, 55, 985, 165],
+                0.64,
+            )
+
+        # 播放详情页评论入口：评论图标有时是纯图标，OCR 可能只看到评论数。
+        if perception.page_type == "detail" or any(k in all_text for k in ["评论", "写评论", "发评论"]):
+            _add(
+                "virtual_comment_entry",
+                "button",
+                "评论",
+                "播放页底部评论入口兜底区域",
+                [35, 835, 320, 955],
+                0.60,
+            )
+
+        # 底部“我的”Tab 兜底。
+        if any(k in all_text for k in ["首页", "会员", "我的", "随刻"]):
+            _add(
+                "virtual_mine_tab",
+                "tab",
+                "我的",
+                "底部导航我的Tab兜底区域",
+                [760, 895, 1000, 1000],
+                0.65,
+            )
+
+        # 我的页下载/离线缓存区域兜底。
+        if perception.page_type == "settings" or any(k in all_text for k in ["离线缓存", "下载", "缓存"]):
+            _add(
+                "virtual_download_entry",
+                "button",
+                "离线缓存/下载",
+                "我的页面离线缓存或下载入口兜底区域",
+                [40, 230, 960, 420],
+                0.56,
+            )
+
+        return perception
+
+    @staticmethod
+    def _detect_keyboard_via_ocr(ocr_elements: List[Dict[str, Any]]) -> bool:
+        """通过 OCR 元素分布推断键盘是否可见。
+
+        键盘特征：屏幕下半部分有大量短字符，并且这些短字符分布成多行。
+        """
+        if not ocr_elements:
+            return False
+
+        lower_elems = [
+            e for e in ocr_elements
+            if e["bbox"][1] > 520
+            and len(str(e["text"]).strip()) <= 2
+            and float(e.get("confidence", 0.0)) > 0.25
+        ]
+        if len(lower_elems) < 8:
+            return False
+
+        rows: Dict[int, int] = {}
+        for elem in lower_elems:
+            cy = (elem["bbox"][1] + elem["bbox"][3]) // 2
+            row_key = cy // 35
+            rows[row_key] = rows.get(row_key, 0) + 1
+
+        rows_with_many_keys = sum(1 for count in rows.values() if count >= 3)
+        return rows_with_many_keys >= 3
+
+    @staticmethod
+    def _infer_page_type_from_ocr(
+        ocr_texts: List[str],
+        elements: List[UIElement],
+    ) -> Optional[str]:
+        """根据 OCR 文本和元素位置推断页面类型。"""
+        all_text = " ".join(t for t in ocr_texts if t)
+
+        popup_words = ["跳过", "关闭", "知道了", "我知道了", "开通会员", "立即开通", "青少年模式", "广告"]
+        search_words = ["搜索", "搜一搜", "搜索你想看的", "取消", "热搜", "大家都在搜"]
+        detail_words = ["评论", "写评论", "发评论", "发送", "全屏", "缓存", "倍速", "选集", "简介"]
+        mine_words = ["我的", "离线缓存", "下载", "观看历史", "收藏", "设置", "会员中心"]
+        home_words = ["首页", "推荐", "热播", "电视剧", "电影", "综艺", "动漫", "随刻"]
+
+        def _has_any(words: List[str]) -> bool:
+            return any(word in all_text for word in words)
+
+        # 弹窗优先级最高，因为它会遮挡底层页面，直接影响下一步点击。
+        if _has_any(popup_words):
+            return "popup"
+
+        # 搜索页常见组合：顶部搜索/取消 + 热搜/搜索历史/键盘。
+        if _has_any(search_words):
+            return "search"
+
+        # 我的页：包含“我的”且有下载/历史/收藏/设置等个人中心入口。
+        if "我的" in all_text and _has_any(mine_words):
+            return "settings"
+        if _has_any(["离线缓存", "下载", "观看历史", "收藏", "设置"]):
+            return "settings"
+
+        # 播放详情页。
+        if _has_any(detail_words):
+            return "detail"
+
+        # 首页。
+        if _has_any(home_words):
+            # 如果底部或顶部出现首页等频道词，通常是首页。
+            return "home"
+
+        # 位置兜底：底部 Tab 中出现“我的”，但没有明显个人中心入口时，不强制判断为 settings。
+        for elem in elements:
+            if elem.text == "我的" and elem.bbox and len(elem.bbox) == 4 and elem.bbox[1] > 850:
+                return "home"
+
+        return None
+
+    @staticmethod
+    def _describe_screen_position(bbox: List[int]) -> str:
+        """根据 bbox 中心点返回屏幕位置描述。"""
+        if not bbox or len(bbox) != 4:
+            return ""
+        cx = (bbox[0] + bbox[2]) // 2
+        cy = (bbox[1] + bbox[3]) // 2
+
+        # 垂直分区
+        if cy < 80:
+            v = "顶部状态栏"
+        elif cy < 200:
+            v = "顶部区域"
+        elif cy < 500:
+            v = "中部偏上"
+        elif cy < 700:
+            v = "中部"
+        elif cy < 850:
+            v = "中部偏下"
+        else:
+            v = "底部"
+
+        # 水平分区
+        if cx < 250:
+            h = "左侧"
+        elif cx < 500:
+            h = "中间偏左"
+        elif cx < 750:
+            h = "中间偏右"
+        else:
+            h = "右侧"
+
+        return f"屏幕{v}{h}"
 
     @staticmethod
     def _match_ocr_text(
         vlm_text: str,
         ocr_elements: List[Dict[str, Any]],
+        vlm_bbox: Optional[List[int]] = None,
     ) -> Optional[Dict[str, Any]]:
         """在 OCR 结果中查找与 VLM 文本最匹配的元素。
 
-        匹配优先级：完全匹配 > OCR 包含 VLM 文本 > VLM 文本包含 OCR
+        匹配优先级：完全匹配 > OCR 包含 VLM 文本 > VLM 文本包含 OCR > 高重合度匹配
+        当有多个候选时，若提供了 vlm_bbox，选择 bbox 中心最接近者。
         """
         vlm_text = vlm_text.strip()
         if not vlm_text:
             return None
 
-        # 完全匹配（最高优先级）
-        for elem in ocr_elements:
-            if elem["text"] == vlm_text:
-                return elem
+        def _bbox_center(b: List[int]) -> float:
+            return ((b[0] + b[2]) / 2, (b[1] + b[3]) / 2)
 
-        # OCR 文本包含 VLM 文本（如 OCR="搜索按钮" 匹配 VLM="搜索"）
-        for elem in ocr_elements:
-            if vlm_text in elem["text"]:
-                return elem
+        def _bbox_dist(a: List[int], b: List[int]) -> float:
+            ca, cb = _bbox_center(a), _bbox_center(b)
+            return ((ca[0] - cb[0]) ** 2 + (ca[1] - cb[1]) ** 2) ** 0.5
 
-        # VLM 文本包含 OCR 文本（如 VLM="点击搜索按钮" 匹配 OCR="搜索"）
+        def _pick_best(candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+            if not candidates:
+                return None
+            if len(candidates) == 1:
+                return candidates[0]
+            if vlm_bbox and len(vlm_bbox) == 4:
+                return min(candidates, key=lambda e: _bbox_dist(e["bbox"], vlm_bbox))
+            return candidates[0]
+
+        # 1) 完全匹配（最高优先级）
+        exact = [e for e in ocr_elements if e["text"] == vlm_text]
+        if exact:
+            return _pick_best(exact)
+
+        # 2) OCR 文本包含 VLM 文本（如 OCR="搜索按钮" 匹配 VLM="搜索"）
+        contains = [e for e in ocr_elements if vlm_text in e["text"]]
+        if contains:
+            return _pick_best(contains)
+
+        # 3) VLM 文本包含 OCR 文本（如 VLM="点击搜索按钮" 匹配 OCR="搜索"）
+        contained = [e for e in ocr_elements if e["text"] in vlm_text]
+        if contained:
+            return _pick_best(contained)
+
+        # 4) 字符重叠度匹配：两个文本有≥50%字符重叠时视为匹配
+        overlaps = []
         for elem in ocr_elements:
-            if elem["text"] in vlm_text:
-                return elem
+            vlm_chars = set(vlm_text)
+            ocr_chars = set(elem["text"])
+            if not vlm_chars or not ocr_chars:
+                continue
+            overlap = len(vlm_chars & ocr_chars)
+            min_len = min(len(vlm_chars), len(ocr_chars))
+            if min_len >= 2 and overlap / min_len >= 0.5:
+                overlaps.append(elem)
+        if overlaps:
+            return _pick_best(overlaps)
 
         return None
 
@@ -433,27 +847,33 @@ class PerceptionModule:
     def _is_likely_interactive(ocr_elem: Dict[str, Any]) -> bool:
         """判断 OCR 元素是否可能是可交互控件（按钮、Tab、输入框等）。
 
-        启发式规则：
-        - 短文本（1~8 字）更可能是按钮/Tab
-        - 过长文本一般是内容/描述，不是控件
-        - 靠近底部（y>850）的文字大概率是导航Tab
+        启发式规则（放宽版本，尽可能保留更多元素给 C 模块选择）：
+        - 短文本（1~15 字）大概率是按钮/Tab/标签
+        - 底部区域（y>820）的文字大概率是导航Tab
+        - 过长文本（>30字）一般是正文内容，非控件
         """
         text = ocr_elem["text"]
         bbox = ocr_elem["bbox"]
         text_len = len(text)
 
-        # 太短（1字且非中文）或太长（>20字）不太像交互控件
-        if text_len > 20:
-            return False
-        if text_len == 1 and not ('一' <= text <= '鿿'):
+        # 太长（>30字）一般是文章内容/描述，非控件
+        if text_len > 30:
             return False
 
-        # 底部区域（y1 > 850）大概率是导航Tab
-        if bbox[1] > 850 and text_len <= 6:
+        # 纯数字且长度 > 5（可能是计数器/ID，不太可能交互）
+        if text.isdigit() and text_len > 5:
+            return False
+
+        # 底部区域（y1 > 820）大概率是导航Tab
+        if bbox[1] > 820 and text_len <= 8:
             return True
 
-        # 短文本（2~8 字）更可能是按钮
-        if 2 <= text_len <= 8:
+        # 短文本（1~15 字）很可能是按钮/Tab/标签
+        if text_len <= 15:
+            return True
+
+        # 中长文本（15-30字），如果在顶部可能是标题，在中间可能是描述
+        if text_len <= 30:
             return True
 
         return False
@@ -533,16 +953,59 @@ class PerceptionModule:
         return "\n".join(lines)
 
     @staticmethod
+    def _infer_ocr_role_hint(text: str, bbox: List[int]) -> str:
+        """根据文字内容和位置推断角色提示，帮助VLM更准确理解元素功能。
+        只在置信度高时给出提示，避免误导。"""
+        t = text.strip()
+        if not t:
+            return ""
+
+        # 底部区域（y>880）的短文字 → 底部导航Tab
+        if bbox[1] > 880 and len(t) <= 6:
+            return "底部导航Tab"
+
+        # 完全匹配的关闭/跳过按钮
+        if t in ("关闭", "跳过", "×", "✕", "取消", "Close", "Skip", "知道了", "我知道了"):
+            return "关闭/跳过按钮"
+
+        # 完全匹配的确认按钮
+        if t in ("确认", "确定", "提交", "发送", "发布", "OK", "确认发布", "立即发布"):
+            return "确认/提交按钮"
+
+        # 搜索框（明确包含"搜索"+框/栏）
+        if ("搜索" in t or "搜" in t) and any(kw in t for kw in ["框", "栏", "输入", "Search"]):
+            return "搜索输入框"
+
+        # 评论输入区
+        if any(kw in t for kw in ["写评论", "发表评论", "输入评论", "说说你的看法"]):
+            return "评论输入框"
+
+        # 返回按钮
+        if t in ("返回", "后退", "←"):
+            return "返回按钮"
+
+        # 广告标识
+        if "广告" in t and len(t) <= 8:
+            return "广告标识"
+
+        return ""
+
+    @staticmethod
     def _format_ocr_list(ocr_elements: List[Dict[str, Any]]) -> tuple:
-        """将 OCR 元素格式化为 prompt 中的文本列表。"""
+        """将 OCR 元素格式化为 prompt 中的文本列表。元素已在上游按空间位置排序。"""
         if not ocr_elements:
             return "（OCR 未识别到文字或 OCR 引擎不可用）", 0
 
         lines = []
         for elem in ocr_elements:
+            hint = PerceptionModule._infer_ocr_role_hint(elem["text"], elem["bbox"])
+            hint_str = f" |角色: {hint}" if hint else ""
+            bbox = elem["bbox"]
+            cx = (bbox[0] + bbox[2]) // 2
+            cy = (bbox[1] + bbox[3]) // 2
             lines.append(
                 f"  {elem['element_id']}: \"{elem['text']}\" "
-                f"bbox={elem['bbox']} conf={elem['confidence']}"
+                f"bbox={bbox} 中心=({cx},{cy}) conf={elem['confidence']:.2f}{hint_str}"
             )
         return "\n".join(lines), len(ocr_elements)
 
