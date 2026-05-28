@@ -24,8 +24,11 @@ logger = logging.getLogger(__name__)
 
 class ExecutorModule:
     DEFAULT_SCREEN_SIZE = (1080, 2340)
+    # DEFAULT_SCREEN_SIZE = (900, 1600)
     DEFAULT_MUMU_DEVICE = "127.0.0.1:16384"
+    # DEFAULT_MUMU_DEVICE = "127.0.0.1:7555"
     DEFAULT_ADB_PATH = r"D:\Tools\platform-tools\adb.exe"
+    # DEFAULT_ADB_PATH = r"E:\Program Files\Netease\MuMu\nx_device\12.0\shell\adb.exe"
     DEFAULT_LAUNCH_COMPONENTS = {
         "微信": "com.tencent.mm/.ui.LauncherUI",
         "QQ": "com.tencent.mobileqq/.activity.SplashActivity",
