@@ -1,62 +1,121 @@
 """
-A：Executor 工作目录入口。
+A: Executor module entry.
 
-E 模块主循环会调用 A 的两个核心函数：
-1. build_device_command(decision)
-2. compile_decision(decision)
-
-其中：
-- build_device_command 用于真机执行场景的命令描述生成
-- compile_decision 用于当前离线评测场景，最终返回 AgentOutput
+This version intentionally removes all OPEN-based adb launch logic.
+Only CLICK / SCROLL / TYPE / COMPLETE are supported.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict
+import io
+import logging
+import os
+import re
+import subprocess
+from typing import TYPE_CHECKING, Any, Dict, List, Tuple
 
-from agent_base import ACTION_CLICK, ACTION_COMPLETE, ACTION_OPEN, ACTION_SCROLL, ACTION_TYPE, AgentOutput
+if TYPE_CHECKING:
+    from PIL import Image
+
+from agent_base import ACTION_CLICK, ACTION_COMPLETE, ACTION_SCROLL, ACTION_TYPE, AgentOutput
 from gui_agent.shared.schemas import PlannerDecision, clamp_point
+
+logger = logging.getLogger(__name__)
 
 
 class ExecutorModule:
-    """A 模块：负责将标准决策转换成可执行结果。"""
+    DEFAULT_SCREEN_SIZE = (1080, 2340)
+    DEFAULT_MUMU_DEVICE = "127.0.0.1:16384"
+    DEFAULT_ADB_PATH = r"D:\Tools\platform-tools\adb.exe"
+
+    def __init__(self, adb_path: str | None = None, device_serial: str | None = None) -> None:
+        self._adb_path = self._resolve_adb_path(adb_path)
+        self._device_serial = device_serial or os.environ.get("ADB_DEVICE_SERIAL") or self._detect_device_serial()
+        self._last_visual_size: Tuple[int, int] | None = None
 
     def build_device_command(self, decision: PlannerDecision) -> Dict[str, Any]:
-        """
-        根据 C 模块给出的 PlannerDecision，构建真机执行层可消费的命令描述。
-
-        上层调用位置：
-- E.run_step 中，在最终返回前可选调用
-
-        Returns:
-- executor: 执行器名称，如 mock / adb / appium
-- action: 设备层动作名，如 click / scroll / type / open / complete
-- payload: 设备层需要的动作参数
-        """
+        action = decision.action
+        parameters = self._sanitize_parameters(action, decision.parameters)
+        command = self._build_adb_command(action, parameters)
         return {
-            "executor": "mock",
-            "action": decision.action.lower(),
-            "payload": dict(decision.parameters),
+            "executor": "adb",
+            "adb_path": self._adb_path,
+            "device_serial": self._device_serial,
+            "action": action.lower(),
+            "payload": parameters,
+            "command": command,
         }
 
+    def get_screen_size(self) -> Tuple[int, int]:
+        try:
+            output = self._run_adb(["shell", "wm", "size"], capture_output=True, text=True)
+            text = (output.stdout or "").strip()
+            match = re.search(r"(\d+)\s*x\s*(\d+)", text)
+            if not match:
+                raise ValueError(f"无法解析屏幕尺寸输出: {text!r}")
+            return int(match.group(1)), int(match.group(2))
+        except Exception as exc:
+            logger.warning(
+                "获取屏幕分辨率失败，回退到默认值 %sx%s: %s",
+                self.DEFAULT_SCREEN_SIZE[0],
+                self.DEFAULT_SCREEN_SIZE[1],
+                exc,
+            )
+            return self.DEFAULT_SCREEN_SIZE
+
+    def get_coordinate_space_size(self) -> Tuple[int, int]:
+        """
+        Prefer the latest screenshot size so execution coordinates stay aligned
+        with the exact image that B/C used for perception and planning.
+        """
+        if self._last_visual_size is not None:
+            return self._last_visual_size
+        return self.get_screen_size()
+
+    def execute_adb_command(self, decision: PlannerDecision) -> bool:
+        device_command = self.build_device_command(decision)
+        command = device_command["command"]
+
+        if not command:
+            logger.info("收到 COMPLETE 动作，不执行 adb 命令。")
+            return True
+
+        try:
+            self._run_adb(command, capture_output=True, text=True, check=True)
+            return True
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or "").strip()
+            logger.error("执行 ADB 指令失败: %s | stderr=%s", exc, stderr)
+            return False
+        except Exception as exc:
+            logger.error("执行 ADB 指令失败: %s", exc)
+            return False
+
     def compile_decision(self, decision: PlannerDecision) -> AgentOutput:
-        """
-        将 PlannerDecision 转成当前评测框架要求的 AgentOutput。
-
-        上层调用位置：
-- E.run_step 的最后一步
-
-        Returns:
-- action: 标准动作名，必须是 CLICK / SCROLL / TYPE / OPEN / COMPLETE
-- parameters: 标准动作参数，必须与 agent_base.py 完全一致
-- raw_output: 当前轮的 thought，便于日志和回放
-        """
         action = decision.action
         parameters = self._sanitize_parameters(action, decision.parameters)
         return AgentOutput(action=action, parameters=parameters, raw_output=decision.thought)
 
+    def _build_adb_command(self, action: str, parameters: Dict[str, Any]) -> List[str]:
+        if action == ACTION_CLICK:
+            x, y = self._normalized_to_absolute(parameters["point"])
+            return ["shell", "input", "tap", str(x), str(y)]
+
+        if action == ACTION_SCROLL:
+            sx, sy = self._normalized_to_absolute(parameters["start_point"])
+            ex, ey = self._normalized_to_absolute(parameters["end_point"])
+            return ["shell", "input", "swipe", str(sx), str(sy), str(ex), str(ey), "500"]
+
+        if action == ACTION_TYPE:
+            text = self._escape_adb_text(parameters["text"])
+            return ["shell", "input", "text", text]
+
+        if action == ACTION_COMPLETE:
+            return []
+
+        raise ValueError(f"不支持的动作类型: {action}")
+
     def _sanitize_parameters(self, action: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
-        """对标准动作参数做最后一层校验和兜底。"""
         if action == ACTION_CLICK:
             point = parameters.get("point")
             if not isinstance(point, (list, tuple)) or len(point) != 2:
@@ -79,18 +138,119 @@ class ExecutorModule:
                 raise ValueError("TYPE 参数必须是 {'text': '...'}")
             return {"text": text}
 
-        if action == ACTION_OPEN:
-            app_name = parameters.get("app_name")
-            if not isinstance(app_name, str) or not app_name.strip():
-                raise ValueError("OPEN 参数必须是 {'app_name': '...'}")
-            return {"app_name": app_name.strip()}
-
         if action == ACTION_COMPLETE:
             return {}
 
-        raise ValueError(f"未知动作类型: {action}")
+        raise ValueError(f"不支持的动作类型: {action}")
 
     @staticmethod
     def _is_point(value: Any) -> bool:
         return isinstance(value, (list, tuple)) and len(value) == 2
 
+    def capture_screenshot(self) -> "Image.Image | None":
+        try:
+            from PIL import Image
+
+            result = self._run_adb(
+                ["shell", "screencap", "-p"],
+                capture_output=True,
+                check=True,
+                timeout=10,
+            )
+            png_data = result.stdout.replace(b"\r\n", b"\n")
+            image = Image.open(io.BytesIO(png_data))
+            image.load()
+            self._last_visual_size = (image.width, image.height)
+            return image
+        except subprocess.TimeoutExpired:
+            logger.error("截图超时，ADB 命令在 10 秒内未返回结果。")
+            return None
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr.decode("utf-8", errors="ignore") if exc.stderr else ""
+            logger.error("执行截图命令失败，返回码=%s stderr=%s", exc.returncode, stderr.strip())
+            return None
+        except Exception as exc:
+            logger.error("截图或图像处理失败: %s", exc)
+            return None
+
+    def _normalized_to_absolute(self, point: List[int]) -> Tuple[int, int]:
+        width, height = self.get_coordinate_space_size()
+        x = int(point[0] / 1000.0 * width)
+        y = int(point[1] / 1000.0 * height)
+        return x, y
+
+    @staticmethod
+    def _escape_adb_text(text: str) -> str:
+        if any(ord(ch) > 127 for ch in text):
+            logger.warning("检测到非 ASCII 文本，adb input text 可能无法正确输入中文: %r", text)
+        return text.replace("%", r"\%").replace(" ", "%s")
+
+    def _run_adb(
+        self,
+        command: List[str],
+        *,
+        capture_output: bool = False,
+        text: bool = False,
+        check: bool = True,
+        timeout: int | None = None,
+    ) -> subprocess.CompletedProcess:
+        full_cmd = [self._adb_path]
+        if self._device_serial:
+            full_cmd.extend(["-s", self._device_serial])
+        full_cmd.extend(command)
+        return subprocess.run(
+            full_cmd,
+            capture_output=capture_output,
+            text=text,
+            check=check,
+            timeout=timeout,
+        )
+
+    def _detect_device_serial(self) -> str:
+        devices = self._list_devices()
+        if not devices:
+            return self.DEFAULT_MUMU_DEVICE
+        if self.DEFAULT_MUMU_DEVICE in devices:
+            return self.DEFAULT_MUMU_DEVICE
+        if len(devices) == 1:
+            return devices[0]
+        for serial in devices:
+            if serial.startswith("127.0.0.1:") or serial.startswith("emulator-"):
+                return serial
+        return devices[0]
+
+    def _list_devices(self) -> List[str]:
+        try:
+            result = subprocess.run(
+                [self._adb_path, "devices"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except Exception as exc:
+            logger.warning("列出 adb 设备失败: %s", exc)
+            return []
+
+        devices: List[str] = []
+        for line in (result.stdout or "").splitlines():
+            line = line.strip()
+            if not line or line.startswith("List of devices attached"):
+                continue
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == "device":
+                devices.append(parts[0])
+        return devices
+
+    @classmethod
+    def _resolve_adb_path(cls, adb_path: str | None) -> str:
+        if adb_path:
+            return adb_path
+
+        env_path = os.environ.get("ADB_PATH")
+        if env_path:
+            return env_path
+
+        if os.path.exists(cls.DEFAULT_ADB_PATH):
+            return cls.DEFAULT_ADB_PATH
+
+        return "adb"

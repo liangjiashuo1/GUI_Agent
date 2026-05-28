@@ -550,11 +550,6 @@ complete(content='xxx')
         completion = client.chat.completions.create(
             model=self._model_id,
             messages=messages,
-            extra_body={
-                "thinking": {
-                    "type": "disabled"
-                }
-            }
         )
         
         return completion
