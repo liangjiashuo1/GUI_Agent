@@ -705,47 +705,53 @@ class PerceptionModule:
         ocr_texts: List[str],
         elements: List[UIElement],
     ) -> Optional[str]:
-        """根据 OCR 文本和元素位置推断页面类型。"""
+        """根据 OCR 文本和元素位置推断页面类型。优先级：popup > detail > search > settings > home"""
         all_text = " ".join(t for t in ocr_texts if t)
 
         popup_words = ["跳过", "关闭", "知道了", "我知道了", "开通会员", "立即开通", "青少年模式", "广告"]
-        search_words = ["搜索", "搜一搜", "搜索你想看的", "取消", "热搜", "大家都在搜"]
-        detail_words = ["评论", "写评论", "发评论", "发送", "全屏", "缓存", "倍速", "选集", "简介"]
+        # 强搜索特征（仅搜索页才有，避免"搜索"一词在详情页触发误判）
+        strong_search_words = ["热搜", "大家都在搜", "搜索历史", "搜索你想看的", "搜一搜"]
+        # 强详情页特征（只有播放详情页才有）
+        detail_words = ["选集", "简介", "倍速", "缓存", "全屏", "写评论", "发表评论", "输入评论", "说说你的看法"]
+        # 弱详情特征（详情页常见但搜索页也可能出现）
+        weak_detail_words = ["评论", "发送", "弹幕"]
         mine_words = ["我的", "离线缓存", "下载", "观看历史", "收藏", "设置", "会员中心"]
         home_words = ["首页", "推荐", "热播", "电视剧", "电影", "综艺", "动漫", "随刻"]
 
         def _has_any(words: List[str]) -> bool:
             return any(word in all_text for word in words)
 
-        # 弹窗优先级最高，因为它会遮挡底层页面，直接影响下一步点击。
+        # 1) 弹窗优先级最高，遮挡底层页面。
         if _has_any(popup_words):
             return "popup"
 
-        # 搜索页常见组合：顶部搜索/取消 + 热搜/搜索历史/键盘。
-        if _has_any(search_words):
+        # 2) 详情页优先于搜索页，详情页常有搜索图标易误判。
+        if _has_any(detail_words):
+            return "detail"
+        if _has_any(weak_detail_words) and not _has_any(strong_search_words):
+            return "detail"
+
+        # 3) 搜索页：必须强特征才判，弱词"搜索""取消"不单独触发。
+        if _has_any(strong_search_words):
             return "search"
 
-        # 我的页：包含“我的”且有下载/历史/收藏/设置等个人中心入口。
+        # 4) 我的页
         if "我的" in all_text and _has_any(mine_words):
             return "settings"
         if _has_any(["离线缓存", "下载", "观看历史", "收藏", "设置"]):
             return "settings"
 
-        # 播放详情页。
-        if _has_any(detail_words):
-            return "detail"
-
-        # 首页。
+        # 5) 首页
         if _has_any(home_words):
-            # 如果底部或顶部出现首页等频道词，通常是首页。
             return "home"
 
-        # 位置兜底：底部 Tab 中出现“我的”，但没有明显个人中心入口时，不强制判断为 settings。
+        # 位置兜底：底部 Tab 中出现"我的"
         for elem in elements:
             if elem.text == "我的" and elem.bbox and len(elem.bbox) == 4 and elem.bbox[1] > 850:
                 return "home"
 
         return None
+
 
     @staticmethod
     def _describe_screen_position(bbox: List[int]) -> str:
